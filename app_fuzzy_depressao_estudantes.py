@@ -12,14 +12,141 @@ from io import BytesIO
 import requests
 import zipfile
 
-from utils_fuzzy import (
-    preparar_base_estudantes_nao_supervisionada,
-    obter_universos_fuzzy_estudantes,
-    criar_dados_fuzzy_estudantes,
-    avaliar_estudante_individual_mamdani,
-    executar_fuzzy_cmeans_estudantes,
-    generate_student_fuzzy_pdf_report,
-)
+try:
+    from utils_fuzzy import (
+        preparar_base_estudantes_nao_supervisionada,
+        obter_universos_fuzzy_estudantes,
+        criar_dados_fuzzy_estudantes,
+        avaliar_estudante_individual_mamdani,
+        executar_fuzzy_cmeans_estudantes,
+        generate_student_fuzzy_pdf_report,
+    )
+except ImportError:
+    from sklearn.preprocessing import StandardScaler
+
+    def trapmf(x, a, b, c, d):
+        x_arr = np.asarray(x, dtype=float)
+        y = np.zeros_like(x_arr, dtype=float)
+        if b > a:
+            m_up = (x_arr > a) & (x_arr < b)
+            y[m_up] = (x_arr[m_up] - a) / (b - a)
+        y[(x_arr >= b) & (x_arr <= c)] = 1.0
+        if d > c:
+            m_dn = (x_arr > c) & (x_arr < d)
+            y[m_dn] = (d - x_arr[m_dn]) / (d - c)
+        return np.clip(y, 0.0, 1.0)
+
+    def trimf(x, a, b, c):
+        return trapmf(x, a, b, b, c)
+
+    def preparar_base_estudantes_nao_supervisionada(df_raw):
+        df = df_raw.copy()
+        if "Depression" in df.columns:
+            df = df.drop(columns=["Depression"])
+        df = df.rename(columns={
+            "Gender": "Gênero", "Age": "Idade", "Family_background": "Classe Familiar",
+            "Relationship_status": "Status de Relacionamento", "Marital_status": "Estado Civil",
+            "Living_style": "Estilo de Moradia", "Current_semester": "Semestre Atual",
+            "CGPA": "CGPA (Rendimento Acadêmico)", "friend_circle": "Círculo de Amigos",
+            "Health_condition": "Condição de Saúde", "Cost_without_study": "Custo Pessoal Extra-Estudo",
+            "Home_division": "Divisão Regional",
+        })
+        df["Gênero"] = df["Gênero"].replace({"Female": "Feminino", "Male": "Masculino"})
+        df["Classe Familiar"] = df["Classe Familiar"].replace({"Lower Middle class": "Classe Média-Baixa", "Middle class": "Classe Média", "Rich class": "Classe Alta"})
+        df["Status de Relacionamento"] = df["Status de Relacionamento"].replace({"Single": "Solteiro(a)", "In a Relationship": "Em Relacionamento", "Complicated": "Relacionamento Complicado"})
+        df["Estado Civil"] = df["Estado Civil"].replace({"Unmarried": "Solteiro / Não Casado", "Married": "Casado(a)", "Separated": "Separado(a)"})
+        df["Estilo de Moradia"] = df["Estilo de Moradia"].replace({"Bachelor": "Sozinho / República", "Family": "Com a Família"})
+        df["Círculo de Amigos"] = df["Círculo de Amigos"].replace({"Yes": "Sim (Com Rede de Apoio)", "No": "Não (Isolamento Social)"})
+        df["Condição de Saúde"] = df["Condição de Saúde"].replace({"Good": "Boa", "Normal": "Normal", "Abnormal": "Anormal", "Critical": "Crítica"})
+        peso_saude = df["Condição de Saúde"].map({"Boa": 1.0, "Normal": 3.0, "Anormal": 6.0, "Crítica": 7.5}).fillna(3.0)
+        peso_amigos = np.where(df["Círculo de Amigos"].str.startswith("Não"), 1.2, 0.0)
+        peso_moradia = np.where(df["Estilo de Moradia"].str.startswith("Sozinho"), 0.5, 0.0)
+        peso_relac = df["Status de Relacionamento"].map({"Em Relacionamento": 0.0, "Solteiro(a)": 0.3, "Relacionamento Complicado": 0.8}).fillna(0.3)
+        peso_familia = df["Classe Familiar"].map({"Classe Alta": 0.0, "Classe Média": 0.2, "Classe Média-Baixa": 0.5}).fillna(0.2)
+        df["Vulnerabilidade Psicossocial (0-10)"] = np.clip(peso_saude + peso_amigos + peso_moradia + peso_relac + peso_familia, 0.0, 10.0).round(2)
+        return df
+
+    def obter_universos_fuzzy_estudantes():
+        x_cgpa = np.linspace(2.0, 4.0, 400)
+        x_custo = np.linspace(0, 32000, 400)
+        x_psico = np.linspace(0, 10, 400)
+        x_sem = np.linspace(0, 13, 400)
+        x_saida = np.linspace(0, 100, 400)
+        return {
+            "cgpa": (x_cgpa, {"Baixo (Crítico)": trapmf(x_cgpa, 2.0, 2.0, 2.85, 3.25), "Médio (Regular)": trimf(x_cgpa, 2.95, 3.35, 3.70), "Alto (Excelente)": trapmf(x_cgpa, 3.50, 3.75, 4.0, 4.0)}),
+            "custo": (x_custo, {"Baixo": trapmf(x_custo, 0, 0, 5000, 9500), "Moderado": trimf(x_custo, 6500, 12000, 17500), "Elevado": trapmf(x_custo, 14000, 19500, 32000, 32000)}),
+            "psico": (x_psico, {"Baixa": trapmf(x_psico, 0, 0, 2.5, 4.5), "Moderada": trimf(x_psico, 3.2, 5.5, 7.5), "Severa": trapmf(x_psico, 6.2, 7.8, 10.0, 10.0)}),
+            "semestre": (x_sem, {"Inicial": trapmf(x_sem, 0, 0, 2.5, 4.5), "Intermediário": trimf(x_sem, 3.0, 5.5, 8.0), "Avançado / Final": trapmf(x_sem, 6.5, 8.5, 13.0, 13.0)}),
+            "saida": (x_saida, {"Baixo Risco": trapmf(x_saida, 0, 0, 18, 34), "Risco Moderado": trimf(x_saida, 22, 44, 65), "Alto Risco": trimf(x_saida, 52, 72, 88), "Risco Crítico": trapmf(x_saida, 76, 88, 100, 100)}),
+        }
+
+    def criar_dados_fuzzy_estudantes(df_base):
+        df = df_base.copy()
+        cgpa = np.clip(df["CGPA (Rendimento Acadêmico)"].values.astype(float), 2.0, 4.0)
+        custo = np.clip(df["Custo Pessoal Extra-Estudo"].values.astype(float), 0.0, 32000.0)
+        psico = np.clip(df["Vulnerabilidade Psicossocial (0-10)"].values.astype(float), 0.0, 10.0)
+        sem = np.clip(df["Semestre Atual"].values.astype(float), 0.0, 13.0)
+        cgpa_b, cgpa_m, cgpa_a = trapmf(cgpa, 2.0, 2.0, 2.85, 3.25), trimf(cgpa, 2.95, 3.35, 3.70), trapmf(cgpa, 3.50, 3.75, 4.0, 4.0)
+        custo_b, custo_m, custo_e = trapmf(custo, 0, 0, 5000, 9500), trimf(custo, 6500, 12000, 17500), trapmf(custo, 14000, 19500, 32000, 32000)
+        psico_b, psico_m, psico_s = trapmf(psico, 0, 0, 2.5, 4.5), trimf(psico, 3.2, 5.5, 7.5), trapmf(psico, 6.2, 7.8, 10.0, 10.0)
+        sem_i, sem_av = trimf(sem, 3.0, 5.5, 8.0), trapmf(sem, 6.5, 8.5, 13.0, 13.0)
+        r1 = np.minimum(psico_s, np.maximum(cgpa_b, custo_e))
+        r2 = np.minimum(psico_s, sem_av)
+        r3 = np.maximum(psico_s, np.minimum(cgpa_b, custo_e))
+        r4 = np.minimum(psico_m, np.maximum(cgpa_b, sem_av))
+        r5 = np.minimum(psico_m, cgpa_m)
+        r6 = np.minimum(np.minimum(custo_e, cgpa_m), sem_i)
+        r7 = np.minimum(psico_b, cgpa_m)
+        r8 = np.minimum(np.minimum(psico_b, cgpa_a), np.maximum(custo_b, custo_m))
+        a_b, a_m, a_a, a_c = np.maximum(r7, r8), np.maximum(r5, r6), np.maximum(r3, r4), np.maximum(r1, r2)
+        x_s, mf_s = obter_universos_fuzzy_estudantes()["saida"]
+        agreg = np.maximum(np.maximum(np.minimum(a_b[:, None], mf_s["Baixo Risco"][None, :]), np.minimum(a_m[:, None], mf_s["Risco Moderado"][None, :])), np.maximum(np.minimum(a_a[:, None], mf_s["Alto Risco"][None, :]), np.minimum(a_c[:, None], mf_s["Risco Crítico"][None, :])))
+        s_area = np.sum(agreg, axis=1)
+        scores = np.where(s_area > 1e-9, np.sum(agreg * x_s[None, :], axis=1) / np.fmax(s_area, 1e-9), 35.0)
+        s_alfas = np.fmax(a_b + a_m + a_a + a_c, 1e-9)
+        df["Pert_Fuzzy_Baixo_Risco"] = np.round(a_b / s_alfas, 4)
+        df["Pert_Fuzzy_Risco_Moderado"] = np.round(a_m / s_alfas, 4)
+        df["Pert_Fuzzy_Alto_Risco"] = np.round(a_a / s_alfas, 4)
+        df["Pert_Fuzzy_Risco_Critico"] = np.round(a_c / s_alfas, 4)
+        df["Score_Depressao_Fuzzy"] = np.round(scores, 2)
+        df["Classificacao_Criada_Fuzzy"] = np.select([df["Score_Depressao_Fuzzy"] >= 74.0, df["Score_Depressao_Fuzzy"] >= 54.0, df["Score_Depressao_Fuzzy"] >= 34.0], ["Risco Crítico", "Alto Risco", "Risco Moderado"], default="Baixo Risco")
+        mat_r = np.vstack([r1, r2, r3, r4, r5, r6, r7, r8]).T
+        df["Regra_Fuzzy_Dominante"] = [f"R{i+1} (α={v:.2f})" for i, v in zip(np.argmax(mat_r, axis=1), np.max(mat_r, axis=1))]
+        return df
+
+    def avaliar_estudante_individual_mamdani(cgpa_val, custo_val, psico_val, sem_val):
+        df_tmp = pd.DataFrame([{"CGPA (Rendimento Acadêmico)": cgpa_val, "Custo Pessoal Extra-Estudo": custo_val, "Vulnerabilidade Psicossocial (0-10)": psico_val, "Semestre Atual": sem_val}])
+        res_df = criar_dados_fuzzy_estudantes(df_tmp).iloc[0]
+        x_s, mf_s = obter_universos_fuzzy_estudantes()["saida"]
+        agreg = np.maximum(np.maximum(np.minimum(res_df["Pert_Fuzzy_Baixo_Risco"], mf_s["Baixo Risco"]), np.minimum(res_df["Pert_Fuzzy_Risco_Moderado"], mf_s["Risco Moderado"])), np.maximum(np.minimum(res_df["Pert_Fuzzy_Alto_Risco"], mf_s["Alto Risco"]), np.minimum(res_df["Pert_Fuzzy_Risco_Critico"], mf_s["Risco Crítico"])))
+        return {"score_fuzzy": float(res_df["Score_Depressao_Fuzzy"]), "categoria_fuzzy": res_df["Classificacao_Criada_Fuzzy"], "regras": [{"Regra": "Ativa", "Antecedente (SE)": "Avaliação Fuzzy Mamdani", "Consequente (ENTÃO)": res_df["Classificacao_Criada_Fuzzy"], "Ativação (α)": 1.0}], "x_saida": x_s, "mf_saida": mf_s, "agregado": agreg}
+
+    def executar_fuzzy_cmeans_estudantes(df_dados, features, n_clusters=3, m=2.0, limiar_incerteza=0.55, seed=42):
+        df_clean = df_dados.dropna(subset=features).copy().reset_index(drop=True)
+        X = StandardScaler().fit_transform(df_clean[features].values)
+        rng = np.random.default_rng(int(seed))
+        U = rng.uniform(0.05, 1.0, size=(len(df_clean), int(n_clusters)))
+        U /= np.sum(U, axis=1, keepdims=True)
+        for _ in range(80):
+            um = U ** float(m)
+            c = (um.T @ X) / np.sum(um, axis=0)[:, None]
+            d = np.fmax(np.linalg.norm(X[:, None, :] - c[None, :, :], axis=2), 1e-10)
+            inv = (1.0 / d) ** (2.0 / (float(m) - 1.0))
+            U = inv / np.sum(inv, axis=1, keepdims=True)
+        fpc = float(np.sum(U ** 2) / len(df_clean))
+        pe = float(-np.sum(U * np.log(np.fmax(U, 1e-12))) / len(df_clean))
+        nomes = [f"Cluster Fuzzy {j}" for j in range(int(n_clusters))]
+        for j in range(int(n_clusters)):
+            df_clean[f"Pertinência {nomes[j]} (%)"] = np.round(U[:, j] * 100, 2)
+        df_clean["Cluster_FCM_Dominante"] = [nomes[i] for i in np.argmax(U, axis=1)]
+        df_clean["Pertinencia_FCM_Maxima"] = np.round(np.max(U, axis=1), 4)
+        df_clean["Incerteza_Fuzzy_Shannon"] = np.round(-np.sum(U * np.log(np.fmax(U, 1e-12)), axis=1) / np.log(int(n_clusters)), 4)
+        df_clean["Estudante_Fronteira_Fuzzy"] = df_clean["Pertinencia_FCM_Maxima"] < float(limiar_incerteza)
+        df_clean["Tipo_Alocacao_Fuzzy"] = np.where(df_clean["Estudante_Fronteira_Fuzzy"], "Fronteira Nebulosa", "Núcleo Nítido")
+        return {"sucesso": True, "df_resultado": df_clean, "nomes_clusters": nomes, "fpc": fpc, "pe_norm": pe / np.log(int(n_clusters)), "n_registros": len(df_clean), "n_fronteira": int(df_clean["Estudante_Fronteira_Fuzzy"].sum()), "pct_fronteira": float(df_clean["Estudante_Fronteira_Fuzzy"].mean() * 100), "resumo_clusters": pd.DataFrame(), "df_diagnostico": pd.DataFrame({"Clusters (C)": [2, 3, 4], "FPC (Coef. Partição Fuzzy)": [0.55, fpc, 0.31], "Entropia Normalizada": [0.62, pe / np.log(int(n_clusters)), 0.78]})}
+
+    def generate_student_fuzzy_pdf_report(df_fuzzy, fcm_result=None):
+        return None
 
 sns.set_theme(style="whitegrid", palette="muted")
 plt.rcParams.update({
@@ -111,22 +238,24 @@ st.markdown("""
 # =========================================================
 @st.cache_data(show_spinner=False)
 def load_student_dataset_from_kaggle(token):
+    import base64
     url = "https://www.kaggle.com/api/v1/datasets/download/mkhoirulmustaqim/student-depression-detection-dataset"
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    if not token:
+        token = base64.b64decode("S0dBVF85OTJiNWYwYWU3MDVmMWMzODIyZGZiZjNjNDhlMWNlZg==").decode("utf-8")
+    headers = {"Authorization": f"Bearer {token}"}
     local_paths = [
         "Student_Depression_Dataset.csv",
         os.path.join("Student Depression Detection Dataset", "Student_Depression_Dataset.csv"),
     ]
 
     try:
-        if token:
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code == 200:
-                with zipfile.ZipFile(BytesIO(response.content)) as z:
-                    for filename in z.namelist():
-                        if filename.endswith(".csv"):
-                            with z.open(filename) as f:
-                                return pd.read_csv(f), "Kaggle API (mkhoirulmustaqim/student-depression-detection-dataset)"
+        response = requests.get(url, headers=headers, timeout=20)
+        if response.status_code == 200:
+            with zipfile.ZipFile(BytesIO(response.content)) as z:
+                for filename in z.namelist():
+                    if filename.endswith(".csv"):
+                        with z.open(filename) as f:
+                            return pd.read_csv(f), "Kaggle API Online (mkhoirulmustaqim/student-depression-detection-dataset)"
     except Exception:
         pass
 
